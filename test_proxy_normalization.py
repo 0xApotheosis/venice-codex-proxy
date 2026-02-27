@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import os
 import unittest
@@ -56,6 +57,86 @@ class NormalizeInputForVeniceTests(unittest.TestCase):
         self.assertEqual(
             normalized["input"][0]["content"][0],
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        )
+
+    def test_is_idempotent_for_already_normalized_content(self):
+        payload = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "already normalized"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                    ],
+                }
+            ]
+        }
+        original = copy.deepcopy(payload)
+
+        normalized, changed = proxy_mod._normalize_input_for_venice(payload)
+
+        self.assertFalse(changed)
+        self.assertIs(normalized, payload)
+        self.assertEqual(normalized, original)
+
+    def test_preserves_non_message_tool_items(self):
+        payload = {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Austin\"}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "sunny",
+                },
+                {
+                    "type": "item_reference",
+                    "id": "item_abc",
+                },
+            ]
+        }
+        original = copy.deepcopy(payload)
+
+        normalized, changed = proxy_mod._normalize_input_for_venice(payload)
+
+        self.assertFalse(changed)
+        self.assertIs(normalized, payload)
+        self.assertEqual(normalized, original)
+
+    def test_mixed_payload_normalizes_messages_without_touching_tool_items(self):
+        payload = {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_999",
+                    "name": "do_thing",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "caption"},
+                        {"type": "input_image", "image_url": "https://example.com/img.png"},
+                    ],
+                },
+            ]
+        }
+
+        normalized, changed = proxy_mod._normalize_input_for_venice(payload)
+
+        self.assertTrue(changed)
+        self.assertEqual(normalized["input"][0], payload["input"][0])
+        self.assertEqual(normalized["input"][1]["content"][0]["type"], "text")
+        self.assertEqual(normalized["input"][1]["content"][1]["type"], "image_url")
+        self.assertEqual(
+            normalized["input"][1]["content"][1]["image_url"],
+            {"url": "https://example.com/img.png"},
         )
 
     def test_returns_unchanged_when_no_compatible_input_list_exists(self):
