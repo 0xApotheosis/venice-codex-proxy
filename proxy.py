@@ -196,6 +196,80 @@ def _extract_response_info(body: bytes) -> str:
     except (json.JSONDecodeError, KeyError):
         return ""
 
+def _normalize_content_part_for_venice(part: dict) -> tuple[dict, bool]:
+    """
+    Normalize OpenAI Responses content-part variants to the format Venice expects.
+
+    Codex desktop may send message content items like:
+      {"type": "input_text", "text": "..."}
+      {"type": "input_image", "image_url": "https://..."}
+
+    Some Venice validators currently expect:
+      {"type": "text", "text": "..."}
+      {"type": "image_url", "image_url": {"url": "https://..."}}
+    """
+    changed = False
+    out = dict(part)
+
+    part_type = out.get("type")
+    if part_type == "input_text":
+        out["type"] = "text"
+        changed = True
+    elif part_type == "input_image":
+        out["type"] = "image_url"
+        changed = True
+
+    image_url = out.get("image_url")
+    if isinstance(image_url, str):
+        out["image_url"] = {"url": image_url}
+        changed = True
+
+    return out, changed
+
+def _normalize_input_for_venice(data: dict) -> tuple[dict, bool]:
+    """Normalize request body fields for Venice compatibility."""
+    raw_input = data.get("input")
+    if not isinstance(raw_input, list):
+        return data, False
+
+    changed = False
+    normalized_items = []
+
+    for item in raw_input:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            normalized_items.append(item)
+            continue
+
+        item_changed = False
+        normalized_content = []
+        for part in content:
+            if isinstance(part, dict):
+                normalized_part, part_changed = _normalize_content_part_for_venice(part)
+                normalized_content.append(normalized_part)
+                item_changed = item_changed or part_changed
+            else:
+                normalized_content.append(part)
+
+        if item_changed:
+            normalized_item = dict(item)
+            normalized_item["content"] = normalized_content
+            normalized_items.append(normalized_item)
+            changed = True
+        else:
+            normalized_items.append(item)
+
+    if not changed:
+        return data, False
+
+    normalized = dict(data)
+    normalized["input"] = normalized_items
+    return normalized, True
+
 async def handle_request(req: web.Request) -> web.StreamResponse:
     """Forward any request to Venice, swapping auth."""
     t0 = time.monotonic()
@@ -243,11 +317,23 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
     if body:
         try:
             data = json.loads(body)
+            body_changed = False
+
+            data, normalized = _normalize_input_for_venice(data)
+            if normalized:
+                body_changed = True
+
             original_model = data.get("model", "")
             if original_model != VENICE_MODEL:
                 data["model"] = VENICE_MODEL
-                body = json.dumps(data).encode()
+                body_changed = True
                 log.info(f"{prefix}    model rewrite: {original_model} -> {VENICE_MODEL}")
+
+            if body_changed:
+                body = json.dumps(data).encode()
+
+            if normalized:
+                log.info(f"{prefix}    normalized input content for Venice image/text compatibility")
         except (json.JSONDecodeError, KeyError):
             pass
     req_info = _extract_request_info(body)

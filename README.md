@@ -2,13 +2,14 @@
 
 A lightweight transparent reverse proxy that routes [OpenAI Codex](https://openai.com/index/codex/) desktop requests through [Venice AI](https://venice.ai).
 
-Venice natively supports the `/v1/responses` API, so this proxy doesn't do any format translation. It simply:
+Venice natively supports the `/v1/responses` API. This proxy stays mostly transparent, while applying a small compatibility normalization for Codex desktop multimodal payloads. It:
 
 1. Accepts requests on `localhost:4000`
-2. Rewrites the model name to `openai-gpt-53-codex`
-3. Swaps the auth header for your Venice API key
-4. Forwards to `https://api.venice.ai/api/v1`
-5. Streams the response back byte-for-byte
+2. Normalizes Codex content parts for Venice compatibility (`input_text` → `text`, `input_image` → `image_url`, and string `image_url` → `{"url": ...}`)
+3. Rewrites the model name to `openai-gpt-53-codex`
+4. Swaps the auth header for your Venice API key
+5. Forwards to `https://api.venice.ai/api/v1`
+6. Streams the response back byte-for-byte
 
 Single file. One dependency (`aiohttp`). No framework overhead.
 
@@ -125,6 +126,16 @@ curl -s http://127.0.0.1:4000/readyz
 
 Both return JSON with service status, upstream base URL, and configured model.
 
+## Tests
+
+Run unit tests with:
+
+```bash
+VENICE_API_KEY=test-key ./venv/bin/python -m unittest -v test_proxy_normalization.py
+```
+
+The test suite validates request normalization for multimodal content and no-op behavior for unsupported input shapes.
+
 ## Managing the Proxy
 
 ```bash
@@ -143,9 +154,14 @@ lsof -i :4000
 
 ## How It Works
 
-Codex desktop sends all requests to the OpenAI `/v1/responses` API. Venice AI supports this endpoint natively for their OpenAI-proxied models, so no request/response format translation is needed.
+Codex desktop sends all requests to the OpenAI `/v1/responses` API. Venice AI supports this endpoint natively for their OpenAI-proxied models.
 
-The proxy rewrites **all** model names to the configured Venice model (`openai-gpt-53-codex` by default). This handles Codex's sub-agent requests (e.g. `gpt-5.1-codex-mini`) that Venice wouldn't recognize.
+To handle current Codex desktop multimodal payload variants, the proxy performs a narrow compatibility normalization before forwarding:
+- `content[].type: input_text` becomes `text`
+- `content[].type: input_image` becomes `image_url`
+- `content[].image_url` string becomes an object: `{"url": ...}`
+
+The proxy also rewrites **all** model names to the configured Venice model (`openai-gpt-53-codex` by default). This handles Codex's sub-agent requests (e.g. `gpt-5.1-codex-mini`) that Venice wouldn't recognize.
 
 ## License
 
