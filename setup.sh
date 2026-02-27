@@ -45,7 +45,7 @@ model_provider = "venice"
 [model_providers.venice]
 name = "Venice AI"
 base_url = "http://localhost:4000/v1"
-env_key = "VENICE_PROXY_KEY"
+experimental_bearer_token = "x"
 TOML
     echo "  Added Venice provider to config.toml"
 fi
@@ -88,5 +88,4 @@ echo "To start manually:  ./start.sh"
 echo "To auto-start:      launchctl load ~/Library/LaunchAgents/com.venice-codex-proxy.plist"
 echo "To stop:            launchctl unload ~/Library/LaunchAgents/com.venice-codex-proxy.plist"
 echo
-echo "Set VENICE_PROXY_KEY to any value (e.g. 'x') in your shell for Codex:"
-echo "  export VENICE_PROXY_KEY=x"
+echo "No extra Codex env var is required; the proxy injects your Venice key from .env."

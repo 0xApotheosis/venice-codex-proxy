@@ -69,6 +69,13 @@ All optional. Defaults are tuned for typical use.
 | `PROXY_PORT` | `4000` | Listen port |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `LOG_FILE` | `./proxy.log` | Log file path |
+| `LOG_STDERR` | `true` | Mirror logs to terminal/stderr (`false` for file-only logs) |
+| `LOG_PROMPTS` | `true` | Include user prompt previews in logs (`false` to disable) |
+| `REQUEST_PREVIEW_CHARS` | `80` | Max chars to include in request preview logs |
+| `MAX_REQUEST_BYTES` | `10485760` | Max request payload size before returning `413` |
+| `UPSTREAM_TIMEOUT_TOTAL` | `300` | Total upstream request timeout (seconds) |
+| `UPSTREAM_TIMEOUT_SOCK_READ` | `120` | Upstream socket-read timeout (seconds) |
+| `UPSTREAM_MAX_CONNECTIONS` | `100` | Max pooled upstream connections |
 
 ## Logging
 
@@ -81,17 +88,42 @@ Logs go to both stderr (visible in terminal) and `proxy.log` (always available).
 ```
 
 Each request logs:
-- Timestamp, method, and path
+- Request ID, timestamp, method, and path
 - Model name (original and rewritten if different)
 - Stream vs sync mode
-- Preview of the user's input
+- Optional preview of the user's input (`LOG_PROMPTS`)
 - Response status, bytes, elapsed time, and token usage
 
+Every proxied response includes `x-request-id` to correlate client errors with proxy logs.
+
 Tail the log in real time:
+
+### Disable terminal logs
+
+Set this in your shell (or LaunchAgent env) before starting:
+
+```bash
+export LOG_STDERR=false
+./start.sh
+```
+
+With `LOG_STDERR=false`, logs still go to `proxy.log`, but not to terminal stderr.
 
 ```bash
 tail -f proxy.log
 ```
+
+## Health Endpoints
+
+```bash
+# Liveness
+curl -s http://127.0.0.1:4000/healthz
+
+# Readiness (same payload)
+curl -s http://127.0.0.1:4000/readyz
+```
+
+Both return JSON with service status, upstream base URL, and configured model.
 
 ## Managing the Proxy
 

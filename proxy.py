@@ -17,6 +17,8 @@ import logging
 import os
 import sys
 import time
+import uuid
+import asyncio
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -25,6 +27,7 @@ from pathlib import Path
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "proxy.log"))
+LOG_STDERR = os.getenv("LOG_STDERR", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 log = logging.getLogger("venice-proxy")
 log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
@@ -34,10 +37,11 @@ _fmt = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Always log to stderr (visible when running in foreground)
-_stderr = logging.StreamHandler(sys.stderr)
-_stderr.setFormatter(_fmt)
-log.addHandler(_stderr)
+# Optional stderr logging (visible when running in foreground)
+if LOG_STDERR:
+    _stderr = logging.StreamHandler(sys.stderr)
+    _stderr.setFormatter(_fmt)
+    log.addHandler(_stderr)
 
 # Also log to file (visible when running via LaunchAgent)
 try:
@@ -55,6 +59,19 @@ LISTEN_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.getenv("PROXY_PORT", "4000"))
 VENICE_BASE = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1")
 VENICE_MODEL = os.getenv("VENICE_MODEL", "openai-gpt-53-codex")
+REQUEST_PREVIEW_CHARS = int(os.getenv("REQUEST_PREVIEW_CHARS", "80"))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(10 * 1024 * 1024)))
+UPSTREAM_TIMEOUT_TOTAL = int(os.getenv("UPSTREAM_TIMEOUT_TOTAL", "300"))
+UPSTREAM_TIMEOUT_SOCK_READ = int(os.getenv("UPSTREAM_TIMEOUT_SOCK_READ", "120"))
+UPSTREAM_MAX_CONNECTIONS = int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100"))
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+LOG_PROMPTS = _env_bool("LOG_PROMPTS", True)
 
 def load_api_key() -> str:
     """Load Venice API key from env or .env file."""
@@ -65,8 +82,11 @@ def load_api_key() -> str:
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
-            if line.startswith("VENICE_API_KEY=") and not line.startswith("#"):
-                return line.split("=", 1)[1].strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == "VENICE_API_KEY":
+                return v.strip().strip('"').strip("'")
     log.error("VENICE_API_KEY not set. Put it in .env or export it.")
     sys.exit(1)
 
@@ -90,7 +110,11 @@ async def get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
         _session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300, sock_read=120)
+            connector=aiohttp.TCPConnector(limit=UPSTREAM_MAX_CONNECTIONS),
+            timeout=aiohttp.ClientTimeout(
+                total=UPSTREAM_TIMEOUT_TOTAL,
+                sock_read=UPSTREAM_TIMEOUT_SOCK_READ,
+            ),
         )
     return _session
 
@@ -112,23 +136,50 @@ def _extract_request_info(body: bytes) -> str:
         data = json.loads(body)
         model = data.get("model", "?")
         stream = data.get("stream", False)
-        # Try to get a snippet of the user's input
+        tag = "stream" if stream else "sync"
+
+        if not LOG_PROMPTS:
+            return f"model={model} [{tag}]"
+
         preview = ""
-        for item in data.get("input", []):
-            if item.get("role") == "user":
+        raw_input = data.get("input", [])
+        if isinstance(raw_input, str):
+            preview = raw_input[:REQUEST_PREVIEW_CHARS]
+        elif isinstance(raw_input, list):
+            for item in raw_input:
+                if not isinstance(item, dict) or item.get("role") != "user":
+                    continue
                 content = item.get("content", [])
                 if isinstance(content, str):
-                    preview = content[:80]
+                    preview = content[:REQUEST_PREVIEW_CHARS]
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and part.get("text"):
-                            preview = part["text"][:80]
+                            preview = str(part["text"])[:REQUEST_PREVIEW_CHARS]
                             break
                 break
-        tag = "stream" if stream else "sync"
+
         return f"model={model} [{tag}] {repr(preview)}" if preview else f"model={model} [{tag}]"
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
         return ""
+
+def _build_upstream_url(req: web.Request) -> str:
+    """Build upstream URL and strip only the /v1 prefix path component."""
+    path = req.path
+    if path == "/v1":
+        path = ""
+    elif path.startswith("/v1/"):
+        path = path[3:]
+
+    upstream_url = f"{VENICE_BASE.rstrip('/')}{path}"
+    if req.query_string:
+        upstream_url += f"?{req.query_string}"
+    return upstream_url
+
+def _request_too_large(req: web.Request) -> bool:
+    if req.content_length is not None and req.content_length > MAX_REQUEST_BYTES:
+        return True
+    return False
 
 def _extract_response_info(body: bytes) -> str:
     """Pull token usage from a non-streaming response body."""
@@ -148,15 +199,23 @@ def _extract_response_info(body: bytes) -> str:
 async def handle_request(req: web.Request) -> web.StreamResponse:
     """Forward any request to Venice, swapping auth."""
     t0 = time.monotonic()
+    req_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    prefix = f"[{req_id}]"
 
-    # Build upstream URL
-    path = req.path  # e.g. /v1/responses
-    # Strip /v1 prefix since VENICE_BASE already includes it
-    if path.startswith("/v1"):
-        path = path[3:]  # /v1/responses -> /responses
-    upstream_url = f"{VENICE_BASE.rstrip('/')}{path}"
-    if req.query_string:
-        upstream_url += f"?{req.query_string}"
+    if _request_too_large(req):
+        log.warning(f"{prefix} <- 413 request too large ({req.content_length} bytes)")
+        return web.json_response(
+            {
+                "error": {
+                    "message": f"Request exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES})",
+                    "type": "request_too_large",
+                }
+            },
+            status=413,
+            headers={"x-request-id": req_id},
+        )
+
+    upstream_url = _build_upstream_url(req)
 
     # Build headers — swap auth, pass everything else through
     headers = {}
@@ -164,9 +223,23 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
         if k.lower() not in STRIP_REQUEST_HEADERS:
             headers[k] = v
     headers["Authorization"] = f"Bearer {VENICE_API_KEY}"
+    headers["X-Request-Id"] = req_id
 
     # Read request body, rewrite model name to Venice target
     body = await req.read()
+    if len(body) > MAX_REQUEST_BYTES:
+        log.warning(f"{prefix} <- 413 request too large ({len(body)} bytes)")
+        return web.json_response(
+            {
+                "error": {
+                    "message": f"Request exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES})",
+                    "type": "request_too_large",
+                }
+            },
+            status=413,
+            headers={"x-request-id": req_id},
+        )
+
     if body:
         try:
             data = json.loads(body)
@@ -174,12 +247,12 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
             if original_model != VENICE_MODEL:
                 data["model"] = VENICE_MODEL
                 body = json.dumps(data).encode()
-                log.info(f"   model rewrite: {original_model} -> {VENICE_MODEL}")
+                log.info(f"{prefix}    model rewrite: {original_model} -> {VENICE_MODEL}")
         except (json.JSONDecodeError, KeyError):
             pass
     req_info = _extract_request_info(body)
 
-    log.info(f"-> {req.method} {req.path}  {req_info}")
+    log.info(f"{prefix} -> {req.method} {req.path}  {req_info}")
 
     session = await get_session()
     try:
@@ -201,26 +274,27 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                         if k.lower() not in STRIP_RESPONSE_HEADERS
                     },
                 )
+                resp.headers["x-request-id"] = req_id
                 await resp.prepare(req)
 
                 bytes_streamed = 0
-                last_data = b""
+                tail_data = b""
                 try:
                     async for chunk in upstream_resp.content.iter_any():
                         await resp.write(chunk)
                         bytes_streamed += len(chunk)
-                        last_data = chunk  # Keep last chunk for token info
+                        tail_data = (tail_data + chunk)[-65536:]  # keep trailing data for usage parsing
                     await resp.write_eof()
                 except ConnectionResetError:
                     elapsed = time.monotonic() - t0
-                    log.info(f"<- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
+                    log.info(f"{prefix} <- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
                     return resp
                 elapsed = time.monotonic() - t0
 
                 # Try to extract usage from the final "response.completed" SSE event
                 usage_info = ""
                 try:
-                    text = last_data.decode("utf-8", errors="ignore")
+                    text = tail_data.decode("utf-8", errors="ignore")
                     for line in reversed(text.splitlines()):
                         if line.startswith("data: ") and "usage" in line:
                             event_data = json.loads(line[6:])
@@ -238,7 +312,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                     pass
 
                 log.info(
-                    f"<- {upstream_resp.status} streamed {bytes_streamed:,} bytes "
+                    f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes "
                     f"in {elapsed:.1f}s{usage_info}"
                 )
                 return resp
@@ -255,25 +329,45 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                         if k.lower() not in STRIP_RESPONSE_HEADERS
                     },
                 )
+                resp.headers["x-request-id"] = req_id
 
-                log.info(f"<- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
+                log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
 
                 if upstream_resp.status >= 400:
-                    log.warning(f"   upstream error body: {resp_body[:500]}")
+                    log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
 
                 return resp
 
     except (ConnectionResetError, OSError) as e:
         elapsed = time.monotonic() - t0
-        log.info(f"<- client disconnected after {elapsed:.1f}s: {e}")
-        return web.Response(status=499)  # client closed
+        log.info(f"{prefix} <- client disconnected after {elapsed:.1f}s: {e}")
+        return web.Response(status=499, headers={"x-request-id": req_id})  # client closed
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - t0
+        log.error(f"{prefix} <- PROXY TIMEOUT after {elapsed:.1f}s")
+        return web.json_response(
+            {"error": {"message": "Upstream timeout", "type": "proxy_timeout"}},
+            status=504,
+            headers={"x-request-id": req_id},
+        )
     except aiohttp.ClientError as e:
         elapsed = time.monotonic() - t0
-        log.error(f"<- PROXY ERROR after {elapsed:.1f}s: {e}")
+        log.error(f"{prefix} <- PROXY ERROR after {elapsed:.1f}s: {e}")
         return web.json_response(
             {"error": {"message": str(e), "type": "proxy_error"}},
             status=502,
+            headers={"x-request-id": req_id},
         )
+
+async def healthz(_req: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "status": "ok",
+            "service": "venice-codex-proxy",
+            "model": VENICE_MODEL,
+            "upstream": VENICE_BASE,
+        }
+    )
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -281,6 +375,8 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
 
 def create_app() -> web.Application:
     app = web.Application()
+    app.router.add_get("/healthz", healthz)
+    app.router.add_get("/readyz", healthz)
     # Catch-all route — forwards everything
     app.router.add_route("*", "/{path:.*}", handle_request)
     return app
@@ -297,6 +393,10 @@ def main():
     log.info(f"  Model:     {VENICE_MODEL}")
     log.info(f"  API Key:   {VENICE_API_KEY[:8]}...{VENICE_API_KEY[-4:]}")
     log.info(f"  Log file:  {LOG_FILE}")
+    log.info(f"  STDERR:    {'on' if LOG_STDERR else 'off'}")
+    log.info(f"  Max req:   {MAX_REQUEST_BYTES:,} bytes")
+    log.info(f"  Timeouts:  total={UPSTREAM_TIMEOUT_TOTAL}s sock_read={UPSTREAM_TIMEOUT_SOCK_READ}s")
+    log.info(f"  Prompt log:{'on' if LOG_PROMPTS else 'off'}")
     log.info("")
 
     app = create_app()
