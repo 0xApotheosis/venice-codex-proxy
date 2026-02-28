@@ -78,8 +78,8 @@ FAST_FALLBACK_STATUSES = {400, 401, 403, 404}
 
 REQUEST_PREVIEW_CHARS = _env_int("REQUEST_PREVIEW_CHARS", 80, min_value=0)
 MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_BYTES", 10 * 1024 * 1024, min_value=1)
-UPSTREAM_TIMEOUT_TOTAL = _env_int("UPSTREAM_TIMEOUT_TOTAL", 300, min_value=1)
-UPSTREAM_TIMEOUT_SOCK_READ = _env_int("UPSTREAM_TIMEOUT_SOCK_READ", 120, min_value=1)
+UPSTREAM_TIMEOUT_TOTAL = _env_int("UPSTREAM_TIMEOUT_TOTAL", 650, min_value=1)
+UPSTREAM_TIMEOUT_SOCK_READ = _env_int("UPSTREAM_TIMEOUT_SOCK_READ", 600, min_value=1)
 UPSTREAM_MAX_CONNECTIONS = _env_int("UPSTREAM_MAX_CONNECTIONS", 100, min_value=1)
 LOG_PROMPTS = _env_bool("LOG_PROMPTS", True)
 
@@ -499,7 +499,20 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
         return web.Response(status=499, headers={"x-request-id": req_id})
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
-        log.error(f"{prefix} <- PROXY TIMEOUT after {elapsed:.1f}s")
+        # Determine which timeout phase likely triggered
+        if elapsed < 10:
+            timeout_phase = "connect"
+        elif elapsed >= UPSTREAM_TIMEOUT_TOTAL - 1:
+            timeout_phase = "total"
+        else:
+            timeout_phase = "read"
+        is_retry_candidate = used_fast_route and timeout_phase != "connect"
+        log.error(
+            f"{prefix} <- PROXY TIMEOUT after {elapsed:.1f}s  "
+            f"timeout_phase={timeout_phase}  "
+            f"model={target_model}  "
+            f"retry_candidate={is_retry_candidate}"
+        )
         return web.json_response(
             {"error": {"message": "Upstream timeout", "type": "proxy_timeout"}},
             status=504,
@@ -507,7 +520,10 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
         )
     except aiohttp.ClientError as e:
         elapsed = time.monotonic() - t0
-        log.error(f"{prefix} <- PROXY ERROR after {elapsed:.1f}s: {e}")
+        log.error(
+            f"{prefix} <- PROXY ERROR after {elapsed:.1f}s  "
+            f"model={target_model}  error={e}"
+        )
         return web.json_response(
             {"error": {"message": str(e), "type": "proxy_error"}},
             status=502,
