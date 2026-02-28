@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-Venice Codex Proxy — transparent reverse proxy for routing OpenAI Codex desktop
+Venice Codex Proxy — transparent reverse proxy for routing OpenAI Codex Desktop
 requests through Venice AI.
-
-Venice natively supports the /v1/responses API, so this proxy simply:
-  1. Accepts any request on localhost:4000
-  2. Swaps the auth header for the Venice API key
-  3. Forwards to https://api.venice.ai/api/v1
-  4. Streams the response back byte-for-byte
-
-No format translation needed. Dead simple.
 """
 
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
 import uuid
-import asyncio
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -32,38 +24,24 @@ LOG_STDERR = os.getenv("LOG_STDERR", "true").strip().lower() in {"1", "true", "y
 log = logging.getLogger("venice-proxy")
 log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-_fmt = logging.Formatter(
-    "%(asctime)s  %(levelname)-5s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-# Optional stderr logging (visible when running in foreground)
 if LOG_STDERR:
     _stderr = logging.StreamHandler(sys.stderr)
     _stderr.setFormatter(_fmt)
     log.addHandler(_stderr)
 
-# Also log to file (visible when running via LaunchAgent)
 try:
     _file = logging.FileHandler(LOG_FILE)
     _file.setFormatter(_fmt)
     log.addHandler(_file)
 except OSError:
-    pass  # Can't write log file — stderr only is fine
+    pass
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-LISTEN_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.getenv("PROXY_PORT", "4000"))
-VENICE_BASE = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1")
-VENICE_MODEL = os.getenv("VENICE_MODEL", "openai-gpt-53-codex")
-REQUEST_PREVIEW_CHARS = int(os.getenv("REQUEST_PREVIEW_CHARS", "80"))
-MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(10 * 1024 * 1024)))
-UPSTREAM_TIMEOUT_TOTAL = int(os.getenv("UPSTREAM_TIMEOUT_TOTAL", "300"))
-UPSTREAM_TIMEOUT_SOCK_READ = int(os.getenv("UPSTREAM_TIMEOUT_SOCK_READ", "120"))
-UPSTREAM_MAX_CONNECTIONS = int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100"))
 
 def _env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -71,13 +49,45 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    try:
+        parsed = int(val)
+    except ValueError:
+        log.warning(f"Invalid {name}={val!r}; using default {default}")
+        return default
+    if parsed < min_value:
+        log.warning(f"Invalid {name}={parsed}; using default {default}")
+        return default
+    return parsed
+
+
+LISTEN_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
+LISTEN_PORT = _env_int("PROXY_PORT", 4000, min_value=1)
+VENICE_BASE = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1")
+VENICE_MODEL = os.getenv("VENICE_MODEL", "openai-gpt-53-codex")
+REQUEST_PREVIEW_CHARS = _env_int("REQUEST_PREVIEW_CHARS", 80, min_value=0)
+MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_BYTES", 10 * 1024 * 1024, min_value=1)
+UPSTREAM_TIMEOUT_TOTAL = _env_int("UPSTREAM_TIMEOUT_TOTAL", 300, min_value=1)
+UPSTREAM_TIMEOUT_SOCK_READ = _env_int("UPSTREAM_TIMEOUT_SOCK_READ", 120, min_value=1)
+UPSTREAM_MAX_CONNECTIONS = _env_int("UPSTREAM_MAX_CONNECTIONS", 100, min_value=1)
 LOG_PROMPTS = _env_bool("LOG_PROMPTS", True)
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    low = value.strip().lower()
+    return not low or "your-venice-api-key" in low or low in {"changeme", "replace-me"}
+
 
 def load_api_key() -> str:
     """Load Venice API key from env or .env file."""
-    key = os.getenv("VENICE_API_KEY")
-    if key:
+    key = os.getenv("VENICE_API_KEY", "").strip()
+    if key and not _looks_like_placeholder(key):
         return key
+
     env_file = Path(__file__).parent / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -86,9 +96,19 @@ def load_api_key() -> str:
                 continue
             k, v = line.split("=", 1)
             if k.strip() == "VENICE_API_KEY":
-                return v.strip().strip('"').strip("'")
-    log.error("VENICE_API_KEY not set. Put it in .env or export it.")
+                candidate = v.strip().strip('"').strip("'")
+                if candidate and not _looks_like_placeholder(candidate):
+                    return candidate
+
+    log.error("VENICE_API_KEY not set. Put it in .env (copy from .env.example) or export it.")
     sys.exit(1)
+
+
+def _mask_secret(secret: str) -> str:
+    if len(secret) <= 8:
+        return "*" * len(secret)
+    return f"{secret[:6]}...{secret[-4:]}"
+
 
 VENICE_API_KEY = load_api_key()
 
@@ -100,11 +120,11 @@ try:
     import aiohttp
     from aiohttp import web
 except ImportError:
-    log.error("Missing dependency. Run: pip install aiohttp")
+    log.error("Missing dependency. Run: pip install -r requirements.txt")
     sys.exit(1)
 
-# Shared client session (connection pooling)
 _session: aiohttp.ClientSession | None = None
+
 
 async def get_session() -> aiohttp.ClientSession:
     global _session
@@ -118,17 +138,25 @@ async def get_session() -> aiohttp.ClientSession:
         )
     return _session
 
-# Headers to strip from the forwarded request (hop-by-hop or irrelevant)
+
 STRIP_REQUEST_HEADERS = {
-    "host", "authorization", "content-length", "transfer-encoding",
-    "connection", "keep-alive", "upgrade",
+    "host",
+    "authorization",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
 }
 
-# Headers to strip from the upstream response
 STRIP_RESPONSE_HEADERS = {
-    "content-length", "transfer-encoding", "connection", "keep-alive",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
     "content-encoding",
 }
+
 
 def _extract_request_info(body: bytes) -> str:
     """Pull model name and a preview from the request body for logging."""
@@ -163,6 +191,7 @@ def _extract_request_info(body: bytes) -> str:
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
         return ""
 
+
 def _build_upstream_url(req: web.Request) -> str:
     """Build upstream URL and strip only the /v1 prefix path component."""
     path = req.path
@@ -176,10 +205,10 @@ def _build_upstream_url(req: web.Request) -> str:
         upstream_url += f"?{req.query_string}"
     return upstream_url
 
+
 def _request_too_large(req: web.Request) -> bool:
-    if req.content_length is not None and req.content_length > MAX_REQUEST_BYTES:
-        return True
-    return False
+    return req.content_length is not None and req.content_length > MAX_REQUEST_BYTES
+
 
 def _extract_response_info(body: bytes) -> str:
     """Pull token usage from a non-streaming response body."""
@@ -196,17 +225,10 @@ def _extract_response_info(body: bytes) -> str:
     except (json.JSONDecodeError, KeyError):
         return ""
 
+
 def _normalize_content_part_for_venice(part: dict) -> tuple[dict, bool]:
     """
     Normalize OpenAI Responses content-part variants to the format Venice expects.
-
-    Codex desktop may send message content items like:
-      {"type": "input_text", "text": "..."}
-      {"type": "input_image", "image_url": "https://..."}
-
-    Some Venice validators currently expect:
-      {"type": "text", "text": "..."}
-      {"type": "image_url", "image_url": {"url": "https://..."}}
     """
     changed = False
     out = dict(part)
@@ -225,6 +247,7 @@ def _normalize_content_part_for_venice(part: dict) -> tuple[dict, bool]:
         changed = True
 
     return out, changed
+
 
 def _normalize_input_for_venice(data: dict) -> tuple[dict, bool]:
     """Normalize request body fields for Venice compatibility."""
@@ -270,6 +293,7 @@ def _normalize_input_for_venice(data: dict) -> tuple[dict, bool]:
     normalized["input"] = normalized_items
     return normalized, True
 
+
 async def handle_request(req: web.Request) -> web.StreamResponse:
     """Forward any request to Venice, swapping auth."""
     t0 = time.monotonic()
@@ -291,7 +315,6 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
 
     upstream_url = _build_upstream_url(req)
 
-    # Build headers — swap auth, pass everything else through
     headers = {}
     for k, v in req.headers.items():
         if k.lower() not in STRIP_REQUEST_HEADERS:
@@ -299,7 +322,6 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
     headers["Authorization"] = f"Bearer {VENICE_API_KEY}"
     headers["X-Request-Id"] = req_id
 
-    # Read request body, rewrite model name to Venice target
     body = await req.read()
     if len(body) > MAX_REQUEST_BYTES:
         log.warning(f"{prefix} <- 413 request too large ({len(body)} bytes)")
@@ -336,29 +358,20 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                 log.info(f"{prefix}    normalized input content for Venice image/text compatibility")
         except (json.JSONDecodeError, KeyError):
             pass
-    req_info = _extract_request_info(body)
 
+    req_info = _extract_request_info(body)
     log.info(f"{prefix} -> {req.method} {req.path}  {req_info}")
 
     session = await get_session()
     try:
-        async with session.request(
-            method=req.method,
-            url=upstream_url,
-            headers=headers,
-            data=body,
-        ) as upstream_resp:
-            # Check if this is a streaming response
+        async with session.request(method=req.method, url=upstream_url, headers=headers, data=body) as upstream_resp:
             ct = upstream_resp.headers.get("content-type", "")
             is_stream = "text/event-stream" in ct or "stream" in ct
 
             if is_stream:
                 resp = web.StreamResponse(
                     status=upstream_resp.status,
-                    headers={
-                        k: v for k, v in upstream_resp.headers.items()
-                        if k.lower() not in STRIP_RESPONSE_HEADERS
-                    },
+                    headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
                 )
                 resp.headers["x-request-id"] = req_id
                 await resp.prepare(req)
@@ -369,25 +382,21 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                     async for chunk in upstream_resp.content.iter_any():
                         await resp.write(chunk)
                         bytes_streamed += len(chunk)
-                        tail_data = (tail_data + chunk)[-65536:]  # keep trailing data for usage parsing
+                        tail_data = (tail_data + chunk)[-65536:]
                     await resp.write_eof()
                 except ConnectionResetError:
                     elapsed = time.monotonic() - t0
                     log.info(f"{prefix} <- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
                     return resp
-                elapsed = time.monotonic() - t0
 
-                # Try to extract usage from the final "response.completed" SSE event
+                elapsed = time.monotonic() - t0
                 usage_info = ""
                 try:
                     text = tail_data.decode("utf-8", errors="ignore")
                     for line in reversed(text.splitlines()):
                         if line.startswith("data: ") and "usage" in line:
                             event_data = json.loads(line[6:])
-                            usage = (
-                                event_data.get("response", {}).get("usage")
-                                or event_data.get("usage")
-                            )
+                            usage = event_data.get("response", {}).get("usage") or event_data.get("usage")
                             if usage:
                                 inp = usage.get("input_tokens", 0)
                                 out = usage.get("output_tokens", 0)
@@ -397,37 +406,31 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                 except Exception:
                     pass
 
-                log.info(
-                    f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes "
-                    f"in {elapsed:.1f}s{usage_info}"
-                )
+                log.info(f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes in {elapsed:.1f}s{usage_info}")
                 return resp
-            else:
-                resp_body = await upstream_resp.read()
-                elapsed = time.monotonic() - t0
-                resp_info = _extract_response_info(resp_body)
 
-                resp = web.Response(
-                    status=upstream_resp.status,
-                    body=resp_body,
-                    headers={
-                        k: v for k, v in upstream_resp.headers.items()
-                        if k.lower() not in STRIP_RESPONSE_HEADERS
-                    },
-                )
-                resp.headers["x-request-id"] = req_id
+            resp_body = await upstream_resp.read()
+            elapsed = time.monotonic() - t0
+            resp_info = _extract_response_info(resp_body)
 
-                log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
+            resp = web.Response(
+                status=upstream_resp.status,
+                body=resp_body,
+                headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
+            )
+            resp.headers["x-request-id"] = req_id
 
-                if upstream_resp.status >= 400:
-                    log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
+            log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
 
-                return resp
+            if upstream_resp.status >= 400:
+                log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
+
+            return resp
 
     except (ConnectionResetError, OSError) as e:
         elapsed = time.monotonic() - t0
         log.info(f"{prefix} <- client disconnected after {elapsed:.1f}s: {e}")
-        return web.Response(status=499, headers={"x-request-id": req_id})  # client closed
+        return web.Response(status=499, headers={"x-request-id": req_id})
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         log.error(f"{prefix} <- PROXY TIMEOUT after {elapsed:.1f}s")
@@ -445,6 +448,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
             headers={"x-request-id": req_id},
         )
 
+
 async def healthz(_req: web.Request) -> web.Response:
     return web.json_response(
         {
@@ -455,29 +459,45 @@ async def healthz(_req: web.Request) -> web.Response:
         }
     )
 
+
+async def index(_req: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "service": "venice-codex-proxy",
+            "status": "ok",
+            "health": "/healthz",
+            "ready": "/readyz",
+            "proxy": "/v1/*",
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 
+
 def create_app() -> web.Application:
     app = web.Application()
+    app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", healthz)
-    # Catch-all route — forwards everything
     app.router.add_route("*", "/{path:.*}", handle_request)
     return app
 
-async def cleanup(app: web.Application):
+
+async def cleanup(_app: web.Application):
     global _session
     if _session and not _session.closed:
         await _session.close()
+
 
 def main():
     log.info("Venice Codex Proxy starting")
     log.info(f"  Listening: http://{LISTEN_HOST}:{LISTEN_PORT}")
     log.info(f"  Upstream:  {VENICE_BASE}")
     log.info(f"  Model:     {VENICE_MODEL}")
-    log.info(f"  API Key:   {VENICE_API_KEY[:8]}...{VENICE_API_KEY[-4:]}")
+    log.info(f"  API Key:   {_mask_secret(VENICE_API_KEY)}")
     log.info(f"  Log file:  {LOG_FILE}")
     log.info(f"  STDERR:    {'on' if LOG_STDERR else 'off'}")
     log.info(f"  Max req:   {MAX_REQUEST_BYTES:,} bytes")
@@ -487,7 +507,14 @@ def main():
 
     app = create_app()
     app.on_cleanup.append(cleanup)
-    web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, print=None)
+
+    try:
+        web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, print=None)
+    except OSError as e:
+        log.error(f"Failed to bind http://{LISTEN_HOST}:{LISTEN_PORT}: {e}")
+        log.error("Tip: stop the existing process or change PROXY_PORT in .env")
+        raise SystemExit(1) from e
+
 
 if __name__ == "__main__":
     main()

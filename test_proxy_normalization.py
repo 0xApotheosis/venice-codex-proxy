@@ -164,5 +164,34 @@ class NormalizeInputForVeniceTests(unittest.TestCase):
         self.assertIs(normalized, payload)
 
 
+class ConfigAndHelpersTests(unittest.TestCase):
+    def test_env_int_accepts_valid_value(self):
+        os.environ["TEST_INT"] = "42"
+        self.assertEqual(proxy_mod._env_int("TEST_INT", 5), 42)
+        os.environ.pop("TEST_INT", None)
+
+    def test_env_int_falls_back_on_invalid_or_small_values(self):
+        import logging
+        logging.disable(logging.CRITICAL)
+        try:
+            os.environ["TEST_INT"] = "abc"
+            self.assertEqual(proxy_mod._env_int("TEST_INT", 7), 7)
+
+            os.environ["TEST_INT"] = "0"
+            self.assertEqual(proxy_mod._env_int("TEST_INT", 9, min_value=1), 9)
+        finally:
+            os.environ.pop("TEST_INT", None)
+            logging.disable(logging.NOTSET)
+
+    def test_mask_secret(self):
+        self.assertEqual(proxy_mod._mask_secret("12345678"), "********")
+        self.assertEqual(proxy_mod._mask_secret("abcdefghijkl"), "abcdef...ijkl")
+
+    def test_placeholder_key_detection(self):
+        self.assertTrue(proxy_mod._looks_like_placeholder("your-venice-api-key-here"))
+        self.assertTrue(proxy_mod._looks_like_placeholder("CHANGEME"))
+        self.assertFalse(proxy_mod._looks_like_placeholder("real-secret-key"))
+
+
 if __name__ == "__main__":
     unittest.main()
