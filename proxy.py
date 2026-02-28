@@ -478,7 +478,10 @@ async def index(_req: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    # aiohttp defaults to a 1 MiB max request body, which is too small for
+    # larger Codex payloads (tool output, long prompts, images). Keep this
+    # aligned with MAX_REQUEST_BYTES so our explicit 413 handling is used.
+    app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", healthz)
