@@ -10,6 +10,67 @@ ENV_FILE="$DIR/.env"
 
 API_KEY="${VENICE_API_KEY:-}"
 
+BOLD=""
+DIM=""
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+CYAN=""
+RESET=""
+
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput >/dev/null 2>&1; then
+  colors="$(tput colors 2>/dev/null || echo 0)"
+  if [[ "$colors" -ge 8 ]]; then
+    BOLD="$(tput bold)"
+    DIM="$(tput dim)"
+    RED="$(tput setaf 1)"
+    GREEN="$(tput setaf 2)"
+    YELLOW="$(tput setaf 3)"
+    BLUE="$(tput setaf 4)"
+    CYAN="$(tput setaf 6)"
+    RESET="$(tput sgr0)"
+  fi
+fi
+
+header() {
+  printf "\n%b\n" "${BOLD}${CYAN}╭────────────────────────────────────╮${RESET}"
+  printf "%b\n" "${BOLD}${CYAN}│      Venice Codex Proxy Setup      │${RESET}"
+  printf "%b\n" "${BOLD}${CYAN}╰────────────────────────────────────╯${RESET}"
+}
+
+divider() {
+  printf "%b\n" "${DIM}────────────────────────────────────────${RESET}"
+}
+
+step() {
+  printf "\n%b\n" "${BOLD}${CYAN}[$1/$2]${RESET} ${BOLD}$3${RESET}"
+}
+
+ok() {
+  printf "  %b\n" "${GREEN}✔${RESET} $1"
+}
+
+info() {
+  printf "  %b\n" "${DIM}•${RESET} $1"
+}
+
+warn() {
+  printf "  %b\n" "${YELLOW}⚠${RESET} $1"
+}
+
+die() {
+  printf "%b\n" "${RED}✖${RESET} $1" >&2
+  exit 1
+}
+
+cmd_hint() {
+  local label="$1"
+  local command="$2"
+  local branch="${3:-├─}"
+  printf "  %b %b  %b\n" "${DIM}${branch}${RESET}" "${DIM}${label}${RESET}" "${BLUE}${command}${RESET}"
+}
+
 is_placeholder_key() {
   local v
   v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
@@ -29,7 +90,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --api-key)
-      [[ $# -ge 2 ]] || { echo "ERROR: --api-key requires a value"; exit 1; }
+      [[ $# -ge 2 ]] || die "--api-key requires a value"
       API_KEY="$2"
       shift 2
       ;;
@@ -38,24 +99,23 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "ERROR: Unknown option: $1"
+      printf "%b\n" "${RED}✖${RESET} Unknown option: $1" >&2
       usage
       exit 1
       ;;
   esac
 done
 
-echo "=== Venice Codex Proxy Setup ==="
-echo
+header
+info "Workspace: $DIR"
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: python3 is required but was not found in PATH."
-  exit 1
+  die "python3 is required but was not found in PATH."
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "$DIR/.env.example" "$ENV_FILE"
-  echo "Created $ENV_FILE from .env.example"
+  ok "Created $ENV_FILE from .env.example"
 fi
 
 if [[ -z "$API_KEY" ]]; then
@@ -84,13 +144,13 @@ if is_placeholder_key "$API_KEY"; then
 fi
 
 if [[ -z "$API_KEY" ]] && [[ -t 0 ]]; then
-  read -r -p "Enter your Venice API key: " API_KEY
+  printf "%b" "${BOLD}${BLUE}🔐 Enter your Venice API key:${RESET} "
+  read -r -s API_KEY
+  printf "\n"
 fi
 
 if [[ -z "$API_KEY" ]]; then
-  echo "ERROR: Venice API key is required."
-  echo "Either rerun with --api-key <key> or set VENICE_API_KEY in $ENV_FILE"
-  exit 1
+  die "Venice API key is required."
 fi
 
 python3 - "$ENV_FILE" "$API_KEY" <<'PY'
@@ -117,20 +177,25 @@ if not updated:
 path.write_text("\n".join(out).rstrip("\n") + "\n")
 PY
 
-echo "[1/3] Python environment"
+ok "Saved API key to $ENV_FILE"
+
+step 1 3 "Python environment"
 if [[ ! -d "$DIR/venv" ]]; then
   python3 -m venv "$DIR/venv"
-  echo "  Created venv"
+  ok "Created virtual environment"
+else
+  info "Using existing virtual environment"
 fi
+info "Installing dependencies"
 "$DIR/venv/bin/python" -m pip install --quiet --upgrade pip
 "$DIR/venv/bin/pip" install --quiet -r "$DIR/requirements.txt"
-echo "  Dependencies installed"
+ok "Dependencies installed"
 
-echo "[2/3] Codex Desktop config"
+step 2 3 "Codex Desktop config"
 mkdir -p "$HOME/.codex"
 if [[ -f "$CODEX_CONFIG" ]]; then
   cp "$CODEX_CONFIG" "${CODEX_CONFIG}.bak"
-  echo "  Backup: ${CODEX_CONFIG}.bak"
+  ok "Backup saved: ${CODEX_CONFIG}.bak"
 fi
 
 python3 - "$CODEX_CONFIG" <<'PY'
@@ -189,17 +254,17 @@ else:
 
 config_path.write_text(text)
 PY
-echo "  Updated $CODEX_CONFIG"
+ok "Updated $CODEX_CONFIG"
 
-echo "[3/3] Smoke check"
+step 3 3 "Smoke check"
 if "$DIR/venv/bin/python" -m unittest -q "$DIR/test_proxy_normalization.py" >/dev/null 2>&1; then
-  echo "  Tests passed"
+  ok "Tests passed"
 else
-  echo "  WARNING: unit tests failed during setup"
+  warn "Unit tests failed during setup"
 fi
 
-echo
-echo "=== Setup complete ==="
-echo "Start the proxy:   ./start.sh"
-echo "Health check:       curl -s http://127.0.0.1:4000/healthz"
-echo "Follow logs:        tail -f proxy.log"
+printf "\n%b\n" "${BOLD}${GREEN}🎉 Setup complete${RESET}"
+divider
+cmd_hint "Start the proxy" "./start.sh" "├─"
+cmd_hint "Health check" "curl -s http://127.0.0.1:4000/healthz" "├─"
+cmd_hint "Follow logs" "tail -f proxy.log" "└─"
