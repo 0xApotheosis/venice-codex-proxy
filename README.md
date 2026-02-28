@@ -1,6 +1,13 @@
 # Venice Codex Proxy
 
-A lightweight reverse proxy that routes Codex Desktop requests through Venice AI.
+A lightweight reverse proxy that sends Codex Desktop requests through Venice AI.
+
+## Model routing
+
+| Route | Model |
+| --- | --- |
+| Main | **GPT-5.3 Codex** |
+| Fast | **Grok Code 4.1** |
 
 ## Setup
 
