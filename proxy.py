@@ -24,16 +24,51 @@ LOG_STDERR = os.getenv("LOG_STDERR", "true").strip().lower() in {"1", "true", "y
 log = logging.getLogger("venice-proxy")
 log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-_fmt = logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+# Plain formatter for file output
+_plain_fmt = logging.Formatter(
+    "%(asctime)s  %(levelname)-5s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# ANSI color codes
+_RESET = "\033[0m"
+_DIM = "\033[2m"
+_BOLD = "\033[1m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_CYAN = "\033[36m"
+
+_LEVEL_COLORS = {
+    "DEBUG": _DIM,
+    "INFO": _GREEN,
+    "WARNING": _YELLOW,
+    "ERROR": _RED,
+    "CRITICAL": f"{_BOLD}{_RED}",
+}
+
+
+class _ColorFormatter(logging.Formatter):
+    """Formatter that adds ANSI colors for terminal output."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = self.formatTime(record, self.datefmt)
+        color = _LEVEL_COLORS.get(record.levelname, "")
+        level = f"{color}{record.levelname:<5}{_RESET}"
+        return f"{_DIM}{ts}{_RESET}  {level}  {record.getMessage()}"
+
 
 if LOG_STDERR:
     _stderr = logging.StreamHandler(sys.stderr)
-    _stderr.setFormatter(_fmt)
+    _stderr.setFormatter(
+        _ColorFormatter(datefmt="%H:%M:%S")
+        if sys.stderr.isatty()
+        else _plain_fmt
+    )
     log.addHandler(_stderr)
 
 try:
     _file = logging.FileHandler(LOG_FILE)
-    _file.setFormatter(_fmt)
+    _file.setFormatter(_plain_fmt)
     log.addHandler(_file)
 except OSError:
     pass
@@ -76,12 +111,10 @@ FAST_REQUEST_MODELS: set[str] = {m.strip() for m in _fast_models_env.split(",") 
 FAST_TARGET_MODEL = os.getenv("FAST_TARGET_MODEL", "grok-code-fast-1")
 FAST_FALLBACK_STATUSES = {400, 401, 403, 404}
 
-REQUEST_PREVIEW_CHARS = _env_int("REQUEST_PREVIEW_CHARS", 80, min_value=0)
 MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_BYTES", 10 * 1024 * 1024, min_value=1)
 UPSTREAM_TIMEOUT_TOTAL = _env_int("UPSTREAM_TIMEOUT_TOTAL", 650, min_value=1)
 UPSTREAM_TIMEOUT_SOCK_READ = _env_int("UPSTREAM_TIMEOUT_SOCK_READ", 600, min_value=1)
 UPSTREAM_MAX_CONNECTIONS = _env_int("UPSTREAM_MAX_CONNECTIONS", 100, min_value=1)
-LOG_PROMPTS = _env_bool("LOG_PROMPTS", True)
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -166,35 +199,19 @@ STRIP_RESPONSE_HEADERS = {
 
 
 def _extract_request_info(body: bytes) -> str:
-    """Pull model name and a preview from the request body for logging."""
+    """Pull model name and conversation depth from the request body for logging."""
     try:
         data = json.loads(body)
         model = data.get("model", "?")
         stream = data.get("stream", False)
         tag = "stream" if stream else "sync"
 
-        if not LOG_PROMPTS:
-            return f"model={model} [{tag}]"
-
-        preview = ""
         raw_input = data.get("input", [])
-        if isinstance(raw_input, str):
-            preview = raw_input[:REQUEST_PREVIEW_CHARS]
-        elif isinstance(raw_input, list):
-            for item in raw_input:
-                if not isinstance(item, dict) or item.get("role") != "user":
-                    continue
-                content = item.get("content", [])
-                if isinstance(content, str):
-                    preview = content[:REQUEST_PREVIEW_CHARS]
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("text"):
-                            preview = str(part["text"])[:REQUEST_PREVIEW_CHARS]
-                            break
-                break
+        if isinstance(raw_input, list):
+            n_msgs = len(raw_input)
+            return f"model={model} [{tag}] msgs={n_msgs}"
 
-        return f"model={model} [{tag}] {repr(preview)}" if preview else f"model={model} [{tag}]"
+        return f"model={model} [{tag}]"
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
         return ""
 
@@ -342,7 +359,7 @@ async def _send_upstream(
                 await resp.write_eof()
             except ConnectionResetError:
                 elapsed = time.monotonic() - t0
-                log.info(f"{prefix} <- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
+                log.info(f"{prefix} \u2190 client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
                 return resp
 
             elapsed = time.monotonic() - t0
@@ -362,7 +379,7 @@ async def _send_upstream(
             except Exception:
                 pass
 
-            log.info(f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes in {elapsed:.1f}s{usage_info}")
+            log.info(f"{prefix} \u2190 {upstream_resp.status} streamed {bytes_streamed:,} bytes in {elapsed:.1f}s{usage_info}")
             return resp
 
         resp_body = await upstream_resp.read()
@@ -376,7 +393,7 @@ async def _send_upstream(
         )
         resp.headers["x-request-id"] = req_id
 
-        log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
+        log.info(f"{prefix} \u2190 {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
 
         if upstream_resp.status >= 400:
             log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
@@ -398,7 +415,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
     prefix = f"[{req_id}]"
 
     if _request_too_large(req):
-        log.warning(f"{prefix} <- 413 request too large ({req.content_length} bytes)")
+        log.warning(f"{prefix} \u2190 413 request too large ({req.content_length} bytes)")
         return web.json_response(
             {
                 "error": {
@@ -421,7 +438,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
 
     body = await req.read()
     if len(body) > MAX_REQUEST_BYTES:
-        log.warning(f"{prefix} <- 413 request too large ({len(body)} bytes)")
+        log.warning(f"{prefix} \u2190 413 request too large ({len(body)} bytes)")
         return web.json_response(
             {
                 "error": {
@@ -453,18 +470,18 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
             if data.get("model") != target_model:
                 data["model"] = target_model
                 body_changed = True
-                log.info(f"{prefix}    model route: {original_model} -> {target_model}")
+                log.info(f"{prefix}    model route: {original_model} \u2192 {target_model}")
 
             if body_changed:
                 body = json.dumps(data).encode()
 
             if normalized:
-                log.info(f"{prefix}    normalized input content for Venice image/text compatibility")
+                log.debug(f"{prefix}    normalized input content for Venice compatibility")
         except (json.JSONDecodeError, KeyError):
             pass
 
     req_info = _extract_request_info(body)
-    log.info(f"{prefix} -> {req.method} {req.path}  {req_info}")
+    log.info(f"{prefix} \u2192 {req.method} {req.path}  {req_info}")
 
     session = await get_session()
     try:
@@ -495,7 +512,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
 
     except (ConnectionResetError, OSError) as e:
         elapsed = time.monotonic() - t0
-        log.info(f"{prefix} <- client disconnected after {elapsed:.1f}s: {e}")
+        log.info(f"{prefix} \u2190 client disconnected after {elapsed:.1f}s: {e}")
         return web.Response(status=499, headers={"x-request-id": req_id})
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
@@ -508,7 +525,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
             timeout_phase = "read"
         is_retry_candidate = used_fast_route and timeout_phase != "connect"
         log.error(
-            f"{prefix} <- PROXY TIMEOUT after {elapsed:.1f}s  "
+            f"{prefix} \u2190 PROXY TIMEOUT after {elapsed:.1f}s  "
             f"timeout_phase={timeout_phase}  "
             f"model={target_model}  "
             f"retry_candidate={is_retry_candidate}"
@@ -521,7 +538,7 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
     except aiohttp.ClientError as e:
         elapsed = time.monotonic() - t0
         log.error(
-            f"{prefix} <- PROXY ERROR after {elapsed:.1f}s  "
+            f"{prefix} \u2190 PROXY ERROR after {elapsed:.1f}s  "
             f"model={target_model}  error={e}"
         )
         return web.json_response(
@@ -579,20 +596,29 @@ async def cleanup(_app: web.Application):
         await _session.close()
 
 
+def _startup_banner() -> str:
+    """Build a formatted startup banner string."""
+    lines = [
+        ("Listen", f"http://{LISTEN_HOST}:{LISTEN_PORT}"),
+        ("Upstream", VENICE_BASE),
+        ("Default model", DEFAULT_VENICE_MODEL),
+        ("Fast target", FAST_TARGET_MODEL),
+        ("Fast triggers", ", ".join(sorted(FAST_REQUEST_MODELS))),
+        ("API key", _mask_secret(VENICE_API_KEY)),
+        ("Log file", LOG_FILE),
+        ("Stderr", "on" if LOG_STDERR else "off"),
+        ("Max request", f"{MAX_REQUEST_BYTES:,} bytes"),
+        ("Timeouts", f"total={UPSTREAM_TIMEOUT_TOTAL}s  sock_read={UPSTREAM_TIMEOUT_SOCK_READ}s"),
+    ]
+    label_width = max(len(label) for label, _ in lines)
+    rows = [f"  {label:<{label_width}}  {value}" for label, value in lines]
+    divider = "\u2500" * (label_width + max(len(v) for _, v in lines) + 4)
+    title = "Venice Codex Proxy"
+    return "\n".join([f"\n  {title}", f"  {divider}", *rows, f"  {divider}\n"])
+
+
 def main():
-    log.info("Venice Codex Proxy starting")
-    log.info(f"  Listening: http://{LISTEN_HOST}:{LISTEN_PORT}")
-    log.info(f"  Upstream:  {VENICE_BASE}")
-    log.info(f"  Default model: {DEFAULT_VENICE_MODEL}")
-    log.info(f"  Fast target:   {FAST_TARGET_MODEL}")
-    log.info(f"  Fast triggers: {sorted(FAST_REQUEST_MODELS)}")
-    log.info(f"  API Key:   {_mask_secret(VENICE_API_KEY)}")
-    log.info(f"  Log file:  {LOG_FILE}")
-    log.info(f"  STDERR:    {'on' if LOG_STDERR else 'off'}")
-    log.info(f"  Max req:   {MAX_REQUEST_BYTES:,} bytes")
-    log.info(f"  Timeouts:  total={UPSTREAM_TIMEOUT_TOTAL}s sock_read={UPSTREAM_TIMEOUT_SOCK_READ}s")
-    log.info(f"  Prompt log:{'on' if LOG_PROMPTS else 'off'}")
-    log.info("")
+    log.info(_startup_banner())
 
     app = create_app()
     app.on_cleanup.append(cleanup)
