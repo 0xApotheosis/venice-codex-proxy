@@ -68,7 +68,14 @@ def _env_int(name: str, default: int, min_value: int = 1) -> int:
 LISTEN_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = _env_int("PROXY_PORT", 4000, min_value=1)
 VENICE_BASE = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1")
-VENICE_MODEL = os.getenv("VENICE_MODEL", "openai-gpt-53-codex")
+DEFAULT_VENICE_MODEL = os.getenv("DEFAULT_VENICE_MODEL", os.getenv("VENICE_MODEL", "openai-gpt-53-codex"))
+
+_fast_models_env = os.getenv("FAST_REQUEST_MODELS", "gpt-5.1-codex-mini,gpt-5.1-codex-nano,gpt-5.1-codex-fast")
+FAST_REQUEST_MODELS: set[str] = {m.strip() for m in _fast_models_env.split(",") if m.strip()}
+
+FAST_TARGET_MODEL = os.getenv("FAST_TARGET_MODEL", "grok-code-fast-1")
+FAST_FALLBACK_STATUSES = {400, 401, 403, 404}
+
 REQUEST_PREVIEW_CHARS = _env_int("REQUEST_PREVIEW_CHARS", 80, min_value=0)
 MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_BYTES", 10 * 1024 * 1024, min_value=1)
 UPSTREAM_TIMEOUT_TOTAL = _env_int("UPSTREAM_TIMEOUT_TOTAL", 300, min_value=1)
@@ -294,8 +301,98 @@ def _normalize_input_for_venice(data: dict) -> tuple[dict, bool]:
     return normalized, True
 
 
+def _route_model(requested_model: str) -> str:
+    """Pick the upstream model based on the incoming request's model field."""
+    if requested_model in FAST_REQUEST_MODELS:
+        return FAST_TARGET_MODEL
+    return DEFAULT_VENICE_MODEL
+
+
+async def _send_upstream(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    headers: dict,
+    body: bytes,
+    req: web.Request,
+    req_id: str,
+    prefix: str,
+    t0: float,
+) -> web.StreamResponse:
+    """Issue a single upstream request and return the client response."""
+    async with session.request(method=method, url=url, headers=headers, data=body) as upstream_resp:
+        ct = upstream_resp.headers.get("content-type", "")
+        is_stream = "text/event-stream" in ct or "stream" in ct
+
+        if is_stream:
+            resp = web.StreamResponse(
+                status=upstream_resp.status,
+                headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
+            )
+            resp.headers["x-request-id"] = req_id
+            await resp.prepare(req)
+
+            bytes_streamed = 0
+            tail_data = b""
+            try:
+                async for chunk in upstream_resp.content.iter_any():
+                    await resp.write(chunk)
+                    bytes_streamed += len(chunk)
+                    tail_data = (tail_data + chunk)[-65536:]
+                await resp.write_eof()
+            except ConnectionResetError:
+                elapsed = time.monotonic() - t0
+                log.info(f"{prefix} <- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
+                return resp
+
+            elapsed = time.monotonic() - t0
+            usage_info = ""
+            try:
+                text = tail_data.decode("utf-8", errors="ignore")
+                for line in reversed(text.splitlines()):
+                    if line.startswith("data: ") and "usage" in line:
+                        event_data = json.loads(line[6:])
+                        usage = event_data.get("response", {}).get("usage") or event_data.get("usage")
+                        if usage:
+                            inp = usage.get("input_tokens", 0)
+                            out = usage.get("output_tokens", 0)
+                            cached = usage.get("input_tokens_details", {}).get("cached_tokens", 0)
+                            usage_info = f"  tokens: {inp} in ({cached} cached) / {out} out"
+                        break
+            except Exception:
+                pass
+
+            log.info(f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes in {elapsed:.1f}s{usage_info}")
+            return resp
+
+        resp_body = await upstream_resp.read()
+        elapsed = time.monotonic() - t0
+        resp_info = _extract_response_info(resp_body)
+
+        resp = web.Response(
+            status=upstream_resp.status,
+            body=resp_body,
+            headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
+        )
+        resp.headers["x-request-id"] = req_id
+
+        log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
+
+        if upstream_resp.status >= 400:
+            log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
+
+        return resp
+
+
+def _is_model_unavailable(resp: web.StreamResponse) -> bool:
+    """Check if a non-streaming response indicates the model is unavailable."""
+    if not isinstance(resp, web.Response):
+        return False
+    return resp.status in FAST_FALLBACK_STATUSES
+
+
 async def handle_request(req: web.Request) -> web.StreamResponse:
-    """Forward any request to Venice, swapping auth."""
+    """Forward any request to Venice, swapping auth and routing models."""
     t0 = time.monotonic()
     req_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:12]
     prefix = f"[{req_id}]"
@@ -336,6 +433,10 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
             headers={"x-request-id": req_id},
         )
 
+    original_model = ""
+    target_model = DEFAULT_VENICE_MODEL
+    used_fast_route = False
+
     if body:
         try:
             data = json.loads(body)
@@ -346,10 +447,13 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
                 body_changed = True
 
             original_model = data.get("model", "")
-            if original_model != VENICE_MODEL:
-                data["model"] = VENICE_MODEL
+            target_model = _route_model(original_model)
+            used_fast_route = target_model == FAST_TARGET_MODEL
+
+            if data.get("model") != target_model:
+                data["model"] = target_model
                 body_changed = True
-                log.info(f"{prefix}    model rewrite: {original_model} -> {VENICE_MODEL}")
+                log.info(f"{prefix}    model route: {original_model} -> {target_model}")
 
             if body_changed:
                 body = json.dumps(data).encode()
@@ -364,68 +468,30 @@ async def handle_request(req: web.Request) -> web.StreamResponse:
 
     session = await get_session()
     try:
-        async with session.request(method=req.method, url=upstream_url, headers=headers, data=body) as upstream_resp:
-            ct = upstream_resp.headers.get("content-type", "")
-            is_stream = "text/event-stream" in ct or "stream" in ct
+        resp = await _send_upstream(session, req.method, upstream_url, headers, body, req, req_id, prefix, t0)
 
-            if is_stream:
-                resp = web.StreamResponse(
-                    status=upstream_resp.status,
-                    headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
-                )
-                resp.headers["x-request-id"] = req_id
-                await resp.prepare(req)
-
-                bytes_streamed = 0
-                tail_data = b""
-                try:
-                    async for chunk in upstream_resp.content.iter_any():
-                        await resp.write(chunk)
-                        bytes_streamed += len(chunk)
-                        tail_data = (tail_data + chunk)[-65536:]
-                    await resp.write_eof()
-                except ConnectionResetError:
-                    elapsed = time.monotonic() - t0
-                    log.info(f"{prefix} <- client disconnected after {bytes_streamed:,} bytes / {elapsed:.1f}s")
-                    return resp
-
-                elapsed = time.monotonic() - t0
-                usage_info = ""
-                try:
-                    text = tail_data.decode("utf-8", errors="ignore")
-                    for line in reversed(text.splitlines()):
-                        if line.startswith("data: ") and "usage" in line:
-                            event_data = json.loads(line[6:])
-                            usage = event_data.get("response", {}).get("usage") or event_data.get("usage")
-                            if usage:
-                                inp = usage.get("input_tokens", 0)
-                                out = usage.get("output_tokens", 0)
-                                cached = usage.get("input_tokens_details", {}).get("cached_tokens", 0)
-                                usage_info = f"  tokens: {inp} in ({cached} cached) / {out} out"
-                            break
-                except Exception:
-                    pass
-
-                log.info(f"{prefix} <- {upstream_resp.status} streamed {bytes_streamed:,} bytes in {elapsed:.1f}s{usage_info}")
-                return resp
-
-            resp_body = await upstream_resp.read()
-            elapsed = time.monotonic() - t0
-            resp_info = _extract_response_info(resp_body)
-
-            resp = web.Response(
-                status=upstream_resp.status,
-                body=resp_body,
-                headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS},
+        # Fallback: if fast model returned an error suggesting unavailability,
+        # retry once with the default model.
+        if used_fast_route and _is_model_unavailable(resp):
+            error_snippet = resp.body[:200] if isinstance(resp, web.Response) and resp.body else b""
+            log.warning(
+                f"{prefix}    fast model {FAST_TARGET_MODEL} unavailable "
+                f"(status={resp.status}); retrying with {DEFAULT_VENICE_MODEL}  "
+                f"fast_model_fallback=true  body_snippet={error_snippet!r}"
             )
-            resp.headers["x-request-id"] = req_id
+            # Rewrite body to use default model
+            try:
+                data = json.loads(body)
+                data["model"] = DEFAULT_VENICE_MODEL
+                body = json.dumps(data).encode()
+            except (json.JSONDecodeError, KeyError):
+                pass
 
-            log.info(f"{prefix} <- {upstream_resp.status} {len(resp_body):,} bytes in {elapsed:.1f}s  {resp_info}")
+            t0 = time.monotonic()
+            resp = await _send_upstream(session, req.method, upstream_url, headers, body, req, req_id, prefix, t0)
+            log.info(f"{prefix}    fast_model_fallback=true  fallback_status={resp.status}")
 
-            if upstream_resp.status >= 400:
-                log.warning(f"{prefix}    upstream error body: {resp_body[:500]}")
-
-            return resp
+        return resp
 
     except (ConnectionResetError, OSError) as e:
         elapsed = time.monotonic() - t0
@@ -454,7 +520,9 @@ async def healthz(_req: web.Request) -> web.Response:
         {
             "status": "ok",
             "service": "venice-codex-proxy",
-            "model": VENICE_MODEL,
+            "default_model": DEFAULT_VENICE_MODEL,
+            "fast_target_model": FAST_TARGET_MODEL,
+            "fast_request_models": sorted(FAST_REQUEST_MODELS),
             "upstream": VENICE_BASE,
         }
     )
@@ -499,7 +567,9 @@ def main():
     log.info("Venice Codex Proxy starting")
     log.info(f"  Listening: http://{LISTEN_HOST}:{LISTEN_PORT}")
     log.info(f"  Upstream:  {VENICE_BASE}")
-    log.info(f"  Model:     {VENICE_MODEL}")
+    log.info(f"  Default model: {DEFAULT_VENICE_MODEL}")
+    log.info(f"  Fast target:   {FAST_TARGET_MODEL}")
+    log.info(f"  Fast triggers: {sorted(FAST_REQUEST_MODELS)}")
     log.info(f"  API Key:   {_mask_secret(VENICE_API_KEY)}")
     log.info(f"  Log file:  {LOG_FILE}")
     log.info(f"  STDERR:    {'on' if LOG_STDERR else 'off'}")
